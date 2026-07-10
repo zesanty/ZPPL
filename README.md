@@ -9,12 +9,26 @@ with
 + recursion
 + dynamic control flow
 
-= TODO
-- [x] 19/6
-- [ ] 22/6
-- [ ] 24/6
-- [ ] 26/6
+## Requirements
 
----
-- [ ] 29/6
-- [ ] Maybe some optimization on comptime?
+- Zig 0.16.X
+
+# Build
+
+## Build the program
+```
+zig build run
+```
+## Run tests
+```
+zig build test --summary all
+```
+
+# TODO
+- lots of general cleanups code
+- Implementing MH
+- Implementing the runTrace 
+- Maybe:
+  + some optimization on comptime?
+  + more distributions...
+  + the parser could be more robust

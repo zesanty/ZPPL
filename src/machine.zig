@@ -1,0 +1,432 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Value = @import("parser.zig").Value;
+
+pub const Distribution = union(enum) {
+    Normal: struct { mu: f64, sigma: f64 },
+    Bernoulli: struct { p: f64 },
+
+    pub fn sample(self: Distribution, random: std.Random) Value {
+        switch (self) {
+            .Normal => |n| {
+                return Value{ .Float = random.floatNorm(f64) * n.sigma + n.mu };
+            },
+            .Bernoulli => |b| {
+                const v = random.float(f64) < b.p;
+                return Value{ .Float = if (v) 1.0 else 0.0 };
+            },
+        }
+    }
+
+    pub fn logProb(self: Distribution, val: Value) f64 {
+        const x: f64 = switch (val) {
+            .Float => |f| f,
+            .Int => |i| @floatFromInt(i),
+            .Bool => |b| if (b) 1.0 else 0.0,
+            else => std.debug.panic("Invalid type for logProb", .{}),
+        };
+        switch (self) {
+            .Normal => |n| {
+                const pi = std.math.pi;
+                const part1 = -0.5 * @log(2.0 * pi * n.sigma * n.sigma);
+                const diff = x - n.mu;
+                const part2 = -(diff * diff) / (2.0 * n.sigma * n.sigma);
+                return part1 + part2;
+            },
+            .Bernoulli => |b| {
+                if (x == 1.0) return @log(b.p);
+                if (x == 0.0) return @log(1.0 - b.p);
+                return -std.math.inf(f64);
+            },
+        }
+    }
+};
+
+pub const Closure = struct {
+    params: []const Value,
+    body: []const Value,
+    env: Env,
+};
+
+pub const AddrTag = enum { let, body, test_tag, then, els, fn_tag, arg, d, v };
+pub const AddrItem = union(AddrTag) {
+    let: usize, body: usize, test_tag: void, then: void, els: void, fn_tag: void, arg: usize, d: void, v: void
+};
+pub const Addr = []const AddrItem;
+
+pub const Env = *std.StringHashMap(Value);
+
+pub const InstrTag = enum { ev, letk, ifk, discard, callk, samplek, observek };
+pub const Instr = union(InstrTag) {
+    ev: struct { e: Value, env: Env, addr: Addr },
+    letk: struct { binds: []const Value, i: usize, body: []const Value, env: Env, addr: Addr },
+    ifk: struct { then_br: Value, els_br: Value, env: Env, addr: Addr },
+    discard: void,
+    callk: struct { n: usize, addr: Addr },
+    samplek: Addr,
+    observek: Addr,
+};
+
+pub const MessageTag = enum { done, sample, observe };
+pub const Message = union(MessageTag) {
+    done: Value,
+    sample: struct { addr: Addr, d: Distribution },
+    observe: struct { addr: Addr, d: Distribution, y: Value },
+};
+
+pub const Machine = struct {
+    alloc: Allocator,
+    C: std.ArrayList(Instr),
+    V: std.ArrayList(Value),
+    env: Env,
+    rng: std.Random.DefaultPrng,
+    log_w: f64,
+
+    pub fn init(alloc: Allocator, seed: u64, init_env: Env) !*Machine {
+        const m = try alloc.create(Machine);
+        m.* = Machine{
+            .alloc = alloc,
+            .C = .empty,
+            .V = .empty,
+            .env = init_env,
+            .rng = std.Random.DefaultPrng.init(seed),
+            .log_w = 0.0,
+        };
+        return m;
+    }
+
+    pub fn fork(self: *Machine, new_seed: u64) !*Machine {
+        const m = try self.alloc.create(Machine);
+        m.* = Machine{
+            .alloc = self.alloc,
+            .C = try self.C.clone(self.alloc),
+            .V = try self.V.clone(self.alloc),
+            .env = try cloneEnv(self.alloc, self.env),
+            .rng = std.Random.DefaultPrng.init(new_seed),
+            .log_w = self.log_w,
+        };
+        return m;
+    }
+
+    pub fn send(self: *Machine, val: Value) !void {
+        try self.V.append(self.alloc, val);
+    }
+};
+
+fn cloneEnv(alloc: Allocator, env: Env) !Env {
+    const new_env = try alloc.create(std.StringHashMap(Value));
+    new_env.* = std.StringHashMap(Value).init(alloc);
+    var it = env.iterator();
+    while (it.next()) |entry| {
+        try new_env.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return new_env;
+}
+
+fn extendAddr(alloc: Allocator, base: Addr, tag: AddrItem) !Addr {
+    var new_addr = try alloc.alloc(AddrItem, base.len + 1);
+    @memcpy(new_addr[0..base.len], base);
+    new_addr[base.len] = tag;
+    return new_addr;
+}
+
+fn pushBody(alloc: Allocator, C: *std.ArrayList(Instr), body: []const Value, env: Env, addr: Addr) !void {
+    var seq: std.ArrayList(Instr) = .empty;
+    defer seq.deinit(alloc);
+
+    var n: usize = 0;
+    while (n < body.len - 1) : (n += 1) {
+        try seq.append(alloc, .{ .ev = .{ .e = body[n], .env = env, .addr = try extendAddr(alloc, addr, .{ .body = n }) } });
+        try seq.append(alloc, .discard);
+    }
+    try seq.append(alloc, .{ .ev = .{ .e = body[body.len - 1], .env = env, .addr = try extendAddr(alloc, addr, .{ .body = body.len - 1 }) } });
+
+    var i: usize = seq.items.len;
+    while (i > 0) {
+        i -= 1;
+        try C.append(alloc, seq.items[i]);
+    }
+}
+
+pub fn stepMachine(m: *Machine) !Message {
+    const alloc = m.alloc;
+    while (m.C.items.len > 0) {
+        const instr = m.C.pop().?;
+        
+        switch (instr) {
+            .ev => |ev| {
+                switch (ev.e) {
+                    .Symbol => |s| {
+                        if (ev.env.get(s)) |val| {
+                            try m.V.append(alloc, val);
+                        } else {
+                            // #TODO should use our own error sets
+                            // FIX: Return standard error instead of panicking
+                            return error.NameError;
+                        }
+                    },
+                    .List => |list| {
+                        if (list.len == 0) {
+                            try m.V.append(alloc, ev.e);
+                            continue;
+                        }
+                        const head = list[0];
+                        if (head == .Symbol and std.mem.eql(u8, head.Symbol, "let")) {
+                            const binds = list[1].List;
+                            const body = list[2..];
+                            if (binds.len > 0) {
+                                try m.C.append(alloc, .{ .letk = .{ .binds = binds, .i = 0, .body = body, .env = ev.env, .addr = ev.addr } });
+                                try m.C.append(alloc, .{ .ev = .{ .e = binds[1], .env = ev.env, .addr = try extendAddr(alloc, ev.addr, .{ .let = 0 }) } });
+                            } else {
+                                try pushBody(alloc, &m.C, body, ev.env, ev.addr);
+                            }
+                        } else if (head == .Symbol and std.mem.eql(u8, head.Symbol, "if")) {
+                            const test_expr = list[1];
+                            const then_expr = list[2];
+                            const els_expr = list[3];
+                            try m.C.append(alloc, .{ .ifk = .{ .then_br = then_expr, .els_br = els_expr, .env = ev.env, .addr = ev.addr } });
+                            try m.C.append(alloc, .{ .ev = .{ .e = test_expr, .env = ev.env, .addr = try extendAddr(alloc, ev.addr, .{ .test_tag = {} }) } });
+                        } else if (head == .Symbol and std.mem.eql(u8, head.Symbol, "fn")) {
+                            const params = list[1].List;
+                            const body = list[2..];
+                            const closure = try alloc.create(Closure);
+                            closure.* = Closure{ .params = params, .body = body, .env = ev.env };
+                            try m.V.append(alloc, .{ .Closure = closure });
+                        } else if (head == .Symbol and std.mem.eql(u8, head.Symbol, "sample")) {
+                            try m.C.append(alloc, .{ .samplek = ev.addr });
+                            try m.C.append(alloc, .{ .ev = .{ .e = list[1], .env = ev.env, .addr = try extendAddr(alloc, ev.addr, .{ .d = {} }) } });
+                        } else if (head == .Symbol and std.mem.eql(u8, head.Symbol, "observe")) {
+                            try m.C.append(alloc, .{ .observek = ev.addr });
+                            try m.C.append(alloc, .{ .ev = .{ .e = list[2], .env = ev.env, .addr = try extendAddr(alloc, ev.addr, .{ .v = {} }) } });
+                            try m.C.append(alloc, .{ .ev = .{ .e = list[1], .env = ev.env, .addr = try extendAddr(alloc, ev.addr, .{ .d = {} }) } });
+                        } else {
+                            try m.C.append(alloc, .{ .callk = .{ .n = list.len - 1, .addr = ev.addr } });
+                            var i: usize = list.len - 1;
+                            while (i > 0) : (i -= 1) {
+                                try m.C.append(alloc, .{ .ev = .{ .e = list[i], .env = ev.env, .addr = try extendAddr(alloc, ev.addr, .{ .arg = i - 1 }) } });
+                            }
+                            try m.C.append(alloc, .{ .ev = .{ .e = list[0], .env = ev.env, .addr = try extendAddr(alloc, ev.addr, .{ .fn_tag = {} }) } });
+                        }
+                    },
+                    else => { try m.V.append(alloc, ev.e); },
+                }
+            },
+            .letk => |lk| {
+                const new_env = try cloneEnv(alloc, lk.env);
+                try new_env.put(lk.binds[2 * lk.i].Symbol, m.V.pop().?);
+                if (2 * (lk.i + 1) < lk.binds.len) {
+                    try m.C.append(alloc, .{ .letk = .{ .binds = lk.binds, .i = lk.i + 1, .body = lk.body, .env = new_env, .addr = lk.addr } });
+                    try m.C.append(alloc, .{ .ev = .{ .e = lk.binds[2 * (lk.i + 1) + 1], .env = new_env, .addr = try extendAddr(alloc, lk.addr, .{ .let = 2 * (lk.i + 1) }) } });
+                } else {
+                    try pushBody(alloc, &m.C, lk.body, new_env, lk.addr);
+                }
+            },
+            .ifk => |ik| {
+                const cond = m.V.pop().?;
+                const is_true = isTruthy(cond); 
+                const branch = if (is_true) ik.then_br else ik.els_br;
+                const tag: AddrItem = if (is_true) .{ .then = {} } else .{ .els = {} };
+                try m.C.append(alloc, .{ .ev = .{ .e = branch, .env = ik.env, .addr = try extendAddr(alloc, ik.addr, tag) } });
+            },
+            .discard => { _ = m.V.pop().?; },
+            .callk => |ck| {
+                var args: std.ArrayList(Value) = .empty;
+                defer args.deinit(alloc);
+                var i: usize = ck.n;
+                while (i > 0) : (i -= 1) {
+                    try args.insert(alloc, 0, m.V.pop().?);
+                }
+                const f = m.V.pop().?;
+                if (f == .Closure) {
+                    const clos = f.Closure;
+                    const new_env = try cloneEnv(alloc, clos.env);
+                    for (clos.params, args.items) |p, arg| {
+                        try new_env.put(p.Symbol, arg);
+                    }
+                    try pushBody(alloc, &m.C, clos.body, new_env, ck.addr);
+                } else if (f == .Primitive) {
+                    const res = try f.Primitive(alloc, args.items);
+                    try m.V.append(alloc, res);
+                } else {
+                    return error.InvalidFunction;
+                }
+            },
+            .samplek => |addr| {
+                const d = m.V.pop().?.Distribution;
+                return Message{ .sample = .{ .addr = addr, .d = d } };
+            },
+            .observek => |addr| {
+                const y = m.V.pop().?;
+                const d = m.V.pop().?.Distribution;
+                return Message{ .observe = .{ .addr = addr, .d = d, .y = y } };
+            },
+        }
+    }
+    return Message{ .done = m.V.pop().? };
+}
+
+pub fn initialMachine(alloc: Allocator, program_forms: []const Value, seed: u64, init_env: Env) !*Machine {
+    const m = try Machine.init(alloc, seed, init_env);
+    
+    var main_expr: ?Value = null;
+    
+    for (program_forms) |form| {
+        switch (form) {
+            .List => |list| {
+                if (list.len > 0 and @as(@import("parser.zig").ValueTag, list[0]) == .Symbol and std.mem.eql(u8, list[0].Symbol, "defn")) {
+                    if (list.len < 4) return error.InvalidDefnSyntax;
+                    const name = list[1].Symbol;
+                    const params = list[2].List;
+                    const body = list[3..];
+                    
+                    const closure = try alloc.create(Closure);
+                    closure.* = Closure{ .params = params, .body = body, .env = init_env };
+                    
+                    try init_env.put(name, .{ .Closure = closure });
+                } else {
+                    main_expr = form;
+                }
+            },
+            else => {
+                main_expr = form;
+            },
+        }
+    }
+    
+    if (main_expr == null) {
+        main_expr = Value{ .Nil = {} };
+    }
+    
+    const empty_addr = try alloc.alloc(AddrItem, 0);
+    try m.C.append(alloc, .{ .ev = .{ .e = main_expr.?, .env = init_env, .addr = empty_addr } });
+    return m;
+}
+
+// ---------------------------------------------------------
+//Likelihood Weighting
+// ---------------------------------------------------------
+pub fn runLW(alloc: Allocator, program_forms: []const Value, seed: u64, init_env: Env) !struct { Value, f64 } {
+    const m = try initialMachine(alloc, program_forms, seed, init_env);
+    while (true) {
+        const msg = try stepMachine(m);
+        switch (msg) {
+            .done => |val| return .{ val, m.log_w },
+            .sample => |s| try m.send(s.d.sample(m.rng.random())),
+            .observe => |o| {
+                m.log_w += o.d.logProb(o.y);
+                try m.send(o.y);
+            },
+        }
+    }
+}
+// ---------------------------------------------------------
+//Sequential Monte Carlo
+// ---------------------------------------------------------
+pub fn advance(m: *Machine) !Message {
+    var msg = try stepMachine(m);
+    while (msg == .sample) {
+        try m.send(msg.sample.d.sample(m.rng.random()));
+        msg = try stepMachine(m);
+    }
+    return msg;
+}
+
+pub fn runSMC(alloc: Allocator, program_forms: []const Value, seeds: []const u64, init_env: Env, N: usize) ![]Value {
+    var particles = try alloc.alloc(*Machine, N);
+    for (0..N) |i| particles[i] = try initialMachine(alloc, program_forms, seeds[i], init_env);
+
+    var final_values = try alloc.alloc(Value, N);
+
+    while (true) {
+        var log_inc = try alloc.alloc(f64, N);
+        var done_count: usize = 0;
+
+        for (0..N) |i| {
+            const msg = try advance(particles[i]);
+            switch (msg) {
+                .done => |val| {
+                    done_count += 1;
+                    final_values[i] = val;
+                },
+                .observe => |o| {
+                    const lp = o.d.logProb(o.y);
+                    particles[i].log_w += lp;
+                    log_inc[i] = lp;
+                    try particles[i].send(o.y);
+                },
+                .sample => unreachable,
+            }
+        }
+        
+        if (done_count == N) {
+            return final_values;
+        } else if (done_count > 0) {
+            return error.SMCParticlesMisaligned;
+        }
+
+        var max_w = -std.math.inf(f64);
+        for (log_inc) |w| if (w > max_w) { max_w = w; };
+        var sum_w: f64 = 0.0;
+        var probs = try alloc.alloc(f64, N);
+        for (log_inc, 0..) |w, i| { probs[i] = @exp(w - max_w); sum_w += probs[i]; }
+        for (probs, 0..) |p, i| probs[i] = p / sum_w;
+
+        var next_particles = try alloc.alloc(*Machine, N);
+        var parent_rng = std.Random.DefaultPrng.init(seeds[0]);
+        
+        for (0..N) |i| {
+            const r = parent_rng.random().float(f64);
+            var parent_idx: usize = 0;
+            var cumul: f64 = 0;
+            for (probs, 0..) |p, j| {
+                cumul += p;
+                if (r <= cumul) { parent_idx = j; break; }
+            }
+            next_particles[i] = try particles[parent_idx].fork(parent_rng.random().int(u64));
+        }
+        particles = next_particles;
+    }
+}
+
+
+// Helper functions / Setup
+
+// Helper to correctly resolve Lisp/Python-style truthiness... kind of sure it works.
+fn isTruthy(val: Value) bool {
+    return switch (val) {
+        .Nil => false,
+        .Bool => |b| b,
+        .Int => |i| i != 0,
+        .Float => |f| f != 0.0,
+        else => true,
+    };
+}
+
+fn primAdd(alloc: Allocator, args: []const Value) !Value {
+    _ = alloc;
+    var sum: f64 = 0;
+    for (args) |a| sum += switch (a) { .Float => |f| f, .Int => |i| @floatFromInt(i), else => 0 };
+    return Value{ .Float = sum };
+}
+
+fn primNormal(alloc: Allocator, args: []const Value) !Value {
+    _ = alloc;
+    const mu = try args[0].asFloat();
+    const sigma = try args[1].asFloat();
+    return Value{ .Distribution = .{ .Normal = .{ .mu = mu, .sigma = sigma } } };
+}
+
+fn primBernoulli(alloc: Allocator, args: []const Value) !Value {
+    _ = alloc;
+    const p = try args[0].asFloat();
+    return Value{ .Distribution = .{ .Bernoulli = .{ .p = p } } };
+}
+
+pub fn createGlobalEnv(alloc: Allocator) !Env {
+    const env = try alloc.create(std.StringHashMap(Value));
+    env.* = std.StringHashMap(Value).init(alloc);
+    try env.put("+", Value{ .Primitive = primAdd });
+    try env.put("normal", Value{ .Primitive = primNormal });
+    try env.put("bernoulli", Value{ .Primitive = primBernoulli });
+    return env;
+}
