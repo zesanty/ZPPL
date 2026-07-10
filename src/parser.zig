@@ -1,6 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+// TODO: value is in this case something needed for the VM, it may be worth it to later move the value into either Main or the VM file
+// And implement a Decoupled Form S-expr abstraction kind of struct that hooks with a Value.
+// Also the parser in general is currently Eager but could be Lazy with a bit of work.
+
 pub const ValueTag = enum {
     Nil,
     Bool,
@@ -14,6 +18,9 @@ pub const ValueTag = enum {
     Primitive,
 };
 
+const Closure = @import("machine.zig").Closure;
+const Distribution = @import("probability.zig").Distribution;
+
 pub const Value = union(ValueTag) {
     Nil: void,
     Bool: bool,
@@ -22,8 +29,8 @@ pub const Value = union(ValueTag) {
     String: []const u8,
     Symbol: []const u8,
     List: []const Value,
-    Closure: *const @import("machine.zig").Closure,
-    Distribution: @import("machine.zig").Distribution,
+    Closure: *const Closure,
+    Distribution: Distribution,
     Primitive: *const fn (alloc: Allocator, args: []const Value) anyerror!Value,
 
     pub fn asFloat(self: Value) !f64 {
@@ -32,6 +39,21 @@ pub const Value = union(ValueTag) {
             .Int => |i| @floatFromInt(i),
             else => error.TypeMismatch,
         };
+    }
+
+    /// Recursively frees all memory allocated for this Value.
+    pub fn deinit(self: Value, allocator: Allocator) void {
+        switch (self) {
+            .String => |s| allocator.free(s),
+            .Symbol => |s| allocator.free(s),
+            .List => |list| {
+                for (list) |item| {
+                    item.deinit(allocator);
+                }
+                allocator.free(list);
+            },
+            else => {},
+        }
     }
 
     pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -95,19 +117,43 @@ fn tokenize(alloc: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 fn parseAtom(alloc: Allocator, token: []const u8) !Value {
-    if (token[0] == '"') {
+    if (token.len >= 2 and token[0] == '"' and token[token.len - 1] == '"') {
         const inner = token[1 .. token.len - 1];
-        const unescaped = try alloc.dupe(u8, inner);
+        var result: std.ArrayList(u8) = .empty;
+        defer result.deinit(alloc);
+        var i: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] == '\\' and i + 1 < inner.len) {
+                const next_c = inner[i + 1];
+                switch (next_c) {
+                    'n' => try result.append(alloc, '\n'),
+                    't' => try result.append(alloc, '\t'),
+                    'r' => try result.append(alloc, '\r'),
+                    '\\' => try result.append(alloc, '\\'),
+                    '"' => try result.append(alloc, '"'),
+                    else => {
+                        try result.append(alloc, '\\');
+                        try result.append(alloc, next_c);
+                    },
+                }
+                i += 2;
+            } else {
+                try result.append(alloc, inner[i]);
+                i += 1;
+            }
+        }
+        const unescaped = try result.toOwnedSlice(alloc);
         return Value{ .String = unescaped };
     }
+
     if (std.mem.eql(u8, token, "true")) return Value{ .Bool = true };
     if (std.mem.eql(u8, token, "false")) return Value{ .Bool = false };
     if (std.mem.eql(u8, token, "nil")) return Value{ .Nil = {} };
-    
+
     if (std.fmt.parseInt(i64, token, 10)) |val| {
         return Value{ .Int = val };
     } else |_| {}
-    
+
     if (std.fmt.parseFloat(f64, token)) |val| {
         return Value{ .Float = val };
     } else |_| {}
@@ -207,7 +253,7 @@ test "parser - round trip unparsing" {
 
         const parsed_again = try parseOne(alloc, printed);
         const printed_again = try std.fmt.allocPrint(alloc, "{f}", .{parsed_again});
-        
+
         try std.testing.expectEqualSlices(u8, printed, printed_again);
     }
 }
