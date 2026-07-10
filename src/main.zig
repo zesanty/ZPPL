@@ -150,39 +150,39 @@ pub fn main(init: std.process.Init) !void {
                     }
                 },
                 .mh => {
-                    // const steps = 10000;
-                    // const warmup = 10000;
-                    // const chain = machine.runMH(temp_alloc, parsed_forms, 42, env, steps, warmup) catch |err| {
-                    //     try stdout_writer.print("MH Runtime error: {s}\n", .{@errorName(err)});
-                    //     continue;
-                    // };
-                    //
-                    // try stdout_writer.print("Run complete ({d} samples, {d} warmup).\nFirst 5 samples: ", .{ steps, warmup });
-                    // for (0..@min(chain.len, 5)) |i| {
-                    //     if (i > 0) try stdout_writer.print(", ", .{});
-                    //     try stdout_writer.print("{f}", .{chain[i]});
-                    // }
-                    //
-                    // var sum: f64 = 0.0;
-                    // var numeric_count: usize = 0;
-                    // for (chain) |res| {
-                    //     switch (res) {
-                    //         .Float => |f| {
-                    //             sum += f;
-                    //             numeric_count += 1;
-                    //         },
-                    //         .Int => |i| {
-                    //             sum += @floatFromInt(i);
-                    //             numeric_count += 1;
-                    //         },
-                    //         else => {},
-                    //     }
-                    // }
-                    // if (numeric_count > 0) {
-                    //     try stdout_writer.print("\nEmpirical Posterior Mean: {d:.4}\n", .{sum / @as(f64, @floatFromInt(numeric_count))});
-                    // } else {
-                    //     try stdout_writer.print("\n", .{});
-                    // }
+                    const steps = 10000; // #TODO: should be a config
+                    const warmup = 1000;
+                    const chain = machine.runMH(temp_alloc, parsed_forms, 42, env, steps, warmup) catch |err| {
+                        try writer.print("MH Runtime error: {s}\n", .{@errorName(err)});
+                        continue;
+                    };
+
+                    try writer.print("Run complete ({d} samples, {d} warmup).\nFirst 5 samples: ", .{ steps, warmup });
+                    for (0..@min(chain.len, 5)) |i| {
+                        if (i > 0) try writer.print(", ", .{});
+                        try writer.print("{f}", .{chain[i]});
+                    }
+
+                    var sum: f64 = 0.0;
+                    var numeric_count: usize = 0;
+                    for (chain) |res| {
+                        switch (res) {
+                            .Float => |f| {
+                                sum += f;
+                                numeric_count += 1;
+                            },
+                            .Int => |i| {
+                                sum += @floatFromInt(i);
+                                numeric_count += 1;
+                            },
+                            else => {},
+                        }
+                    }
+                    if (numeric_count > 0) {
+                        try writer.print("\nEmpirical Posterior Mean: {d:.4}\n", .{sum / @as(f64, @floatFromInt(numeric_count))});
+                    } else {
+                        try writer.print("\n", .{});
+                    }
                 },
             }
         }
@@ -190,7 +190,6 @@ pub fn main(init: std.process.Init) !void {
 
     try writer.flush();
 }
-
 
 const ValueTag = parser.ValueTag;
 const Value = parser.Value;
@@ -207,19 +206,19 @@ test "closure test example" {
     const shift_parsed = try parser.parse(alloc, shift);
     const env1 = try machine.createGlobalEnv(alloc);
     const shift_res = try machine.runLW(alloc, shift_parsed, 0, env1);
-    
+
     try std.testing.expectEqual(@as(f64, 13.0), shift_res[0].Float);
 }
 
 test "geometric mean test" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit(); 
+    defer arena.deinit();
     const alloc = arena.allocator();
 
     const geom = "(defn geom [] (if (sample (bernoulli 0.3)) 0 (+ 1 (geom)))) (geom)";
     const geom_parsed = try parser.parse(alloc, geom);
-    
+
     var seed_rng = std.Random.DefaultPrng.init(1);
     const N = 200000;
     var sum: f64 = 0.0;
@@ -234,7 +233,7 @@ test "geometric mean test" {
         }
     }
     const mean = sum / @as(f64, @floatFromInt(N));
-    
+
     try std.testing.expect(mean >= 2.31 and mean <= 2.35);
 }
 
@@ -288,8 +287,14 @@ test "bits MCMC test" {
     var numeric_count: usize = 0;
     for (chain) |res| {
         switch (res) {
-            .Float => |f| { sum += f; numeric_count += 1; },
-            .Int => |i| { sum += @floatFromInt(i); numeric_count += 1; },
+            .Float => |f| {
+                sum += f;
+                numeric_count += 1;
+            },
+            .Int => |i| {
+                sum += @floatFromInt(i);
+                numeric_count += 1;
+            },
             else => {},
         }
     }
@@ -302,7 +307,7 @@ test "bits MCMC test" {
 test "Normal logProb" {
     const dist = machine.Distribution{ .Normal = .{ .mu = 0.0, .sigma = 1.0 } };
     const prob = dist.logProb(Value{ .Float = 0.0 });
-    
+
     try std.testing.expect(@abs(prob - -0.918938) < 0.0001);
 }
 
@@ -310,7 +315,7 @@ test "Normal sample" {
     var rng = std.Random.DefaultPrng.init(42);
     const dist = machine.Distribution{ .Normal = .{ .mu = 10.0, .sigma = 2.0 } };
     const sample_val = dist.sample(rng.random());
-    
+
     try std.testing.expectEqual(ValueTag.Float, @as(ValueTag, sample_val));
 }
 
@@ -451,7 +456,6 @@ test "Eval HOF" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // (let [apply (fn [f val] (f val))] (apply (fn [x] (* x 2)) 21))
     const parsed = try parser.parse(alloc, "(let [apply (fn [f val] (f val))] (apply (fn [x] (* x 2)) 21))");
     const env = try machine.createGlobalEnv(alloc);
     try env.put("*", Value{ .Primitive = primMul }); // Inject local primitive multiplier
@@ -470,7 +474,6 @@ test "Eval Sample Trace" {
     const env = try machine.createGlobalEnv(alloc);
     const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, std.StringHashMap(Value).init(alloc));
 
-    // Test matches: self assert: result trace sampleValues size equals: 1.
     try std.testing.expectEqual(@as(usize, 1), trace_res.X.count());
 }
 
@@ -484,7 +487,6 @@ test "Eval Observe Trace" {
     const env = try machine.createGlobalEnv(alloc);
     const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, std.StringHashMap(Value).init(alloc));
 
-    // Test matches: self assert: result trace observeDensities size equals: 1.
     try std.testing.expectEqual(@as(usize, 1), trace_res.O.count());
 }
 
@@ -497,16 +499,21 @@ test "SSMH MCMC Gaussian-Gaussian Conjugate" {
     const program = "(let [mu (sample (normal 0.0 1.0))] (observe (normal mu 1.0) 2.3) mu)";
     const parsed = try parser.parse(alloc, program);
     const env = try machine.createGlobalEnv(alloc);
-    
-    // Steps: 1000, Warmup: 200
+
     const chain = try machine.runMH(alloc, parsed, 42, env, 1000, 200);
 
     var sum: f64 = 0.0;
     var numeric_count: usize = 0;
     for (chain) |res| {
         switch (res) {
-            .Float => |f| { sum += f; numeric_count += 1; },
-            .Int => |i| { sum += @floatFromInt(i); numeric_count += 1; },
+            .Float => |f| {
+                sum += f;
+                numeric_count += 1;
+            },
+            .Int => |i| {
+                sum += @floatFromInt(i);
+                numeric_count += 1;
+            },
             else => {},
         }
     }
@@ -515,3 +522,105 @@ test "SSMH MCMC Gaussian-Gaussian Conjugate" {
     try std.testing.expect(posterior_mean >= 0.9 and posterior_mean <= 1.4);
 }
 
+test "Initial Trace Registers Samples" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
+    const env = try machine.createGlobalEnv(alloc);
+    const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, std.StringHashMap(Value).init(alloc));
+
+    try std.testing.expectEqual(@as(usize, 1), trace_res.X.count());
+    try std.testing.expectEqual(@as(usize, 1), trace_res.S.count());
+    try std.testing.expect(trace_res.X.contains(""));
+}
+
+test "Initial Trace Registers Observes" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parser.parse(alloc, "(observe (normal 0.0 1.0) 5.0)");
+    const env = try machine.createGlobalEnv(alloc);
+    const trace_res = try machine.runTrace(alloc, parsed, 0, env, null, std.StringHashMap(Value).init(alloc));
+
+    // Test matches: self assert: (result trace observeDensities includesKey: #(#main))
+    try std.testing.expectEqual(@as(usize, 1), trace_res.O.count());
+}
+
+test "Cache Reuse At Non-Redraw Address" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
+    const env = try machine.createGlobalEnv(alloc);
+
+    // We prepopulate the cache with our sample address mapping to 42
+    var cache = std.StringHashMap(Value).init(alloc);
+    try cache.put("", Value{ .Int = 42 });
+
+    // We set a non-matching redrawAddress ("another/")
+    const trace_res = try machine.runTrace(alloc, parsed, 12, env, "another/", cache);
+
+    try std.testing.expectEqual(@as(i64, 42), trace_res.value.Int);
+    try std.testing.expectEqual(@as(i64, 42), trace_res.X.get("").?.Int);
+}
+
+test "Redraw Site Forces New Sample" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
+    const env = try machine.createGlobalEnv(alloc);
+
+    // We prepopulate the cache with 42
+    var cache = std.StringHashMap(Value).init(alloc);
+    try cache.put("", Value{ .Int = 42 });
+
+    // We force a redraw at the active address ""
+    const trace_res = try machine.runTrace(alloc, parsed, 4542, env, "", cache);
+
+    try std.testing.expect(trace_res.value.Float != 42.0);
+}
+
+test "Absent Address In Cache Forces New Sample" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
+    const env = try machine.createGlobalEnv(alloc);
+
+    // Empty cache
+    const cache = std.StringHashMap(Value).init(alloc);
+
+    const trace_res = try machine.runTrace(alloc, parsed, 142, env, "another/", cache);
+
+    try std.testing.expect(trace_res.X.contains(""));
+    try std.testing.expect(trace_res.X.get("").?.Float != 42.0);
+}
+
+test "Deterministic Trace Handling" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try parser.parse(alloc, "42");
+    const env = try machine.createGlobalEnv(alloc);
+
+    //  the machine should continue and retain the deterministic state
+    const chain = try machine.runMH(alloc, parsed, 3442, env, 5, 2);
+    try std.testing.expectEqual(@as(usize, 5), chain.len);
+    for (chain) |val| {
+        try std.testing.expectEqual(@as(i64, 42), val.Int);
+    }
+}

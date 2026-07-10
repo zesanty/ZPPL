@@ -1,8 +1,8 @@
 # ZPPL
 
 Final project for my Intro to Probablistic Programming @ UBA
-It's a port of both FOPPL and HOPPL features that were seen during the course.
 
+It's a port of both FOPPL and HOPPL features that were seen during the course.
 # Features 
 + micro-matrix/probability lib in zig
 + higher-order functions, recursion, dynamic control flow, closures, functions
@@ -19,7 +19,11 @@ It's a port of both FOPPL and HOPPL features that were seen during the course.
 ```
 zig build
 ```
-## Run enviroment
+
+You will find the binary in ```./zig-out/bin/ZPPL```:
+ + Not passing any arguments will run the REPL enviroment
+
+## Run REPL enviroment
 ```
 zig build run
 ```
@@ -30,9 +34,8 @@ zig build test --summary all
 
 # TODO
 - lots of general cleanups code
-- Implementing MH
-- Implementing the runTrace 
+    - some static polymorphism on machine.zig
+    - lazy parser
 - Maybe:
   + some optimization on comptime?
   + more distributions...
-  + the parser could be more robust

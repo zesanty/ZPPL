@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = @import("parser.zig").Value;
-const Distribution = @import("probability.zig").Distribution;
+pub const Distribution = @import("probability.zig").Distribution;
 
 // Lexical scope
 // Maps built-in funcs/user defined closures OR local variables to a Value (Primitive, Closure, Int in that order.)
@@ -360,6 +360,145 @@ pub fn runSMC(alloc: Allocator, program_forms: []const Value, seeds: []const u64
         particles = next_particles;
     }
 }
+// ---------------------------------------------------------
+// Single-Site Metropolis-Hastings
+// ---------------------------------------------------------
+pub const TraceRunResult = struct {
+    value: Value,
+    X: std.StringHashMap(Value),
+    S: std.StringHashMap(f64),
+    O: std.StringHashMap(f64),
+};
+
+fn addrToString(alloc: Allocator, addr: Addr) ![]const u8 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(alloc);
+    for (addr) |item| {
+        var buf: [32]u8 = undefined;
+        const slice = switch (item) {
+            .let => |v| try std.fmt.bufPrint(&buf, "let:{d}/", .{v}),
+            .body => |v| try std.fmt.bufPrint(&buf, "body:{d}/", .{v}),
+            .test_tag => "test/",
+            .then => "then/",
+            .els => "els/",
+            .fn_tag => "fn/",
+            .arg => |v| try std.fmt.bufPrint(&buf, "arg:{d}/", .{v}),
+            .d => "d/",
+            .v => "v/",
+        };
+        try list.appendSlice(alloc, slice);
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn runTrace(alloc: Allocator, program_forms: []const Value, seed: u64, init_env: Env, x0_str: ?[]const u8, cache: std.StringHashMap(Value)) !TraceRunResult {
+    const m = try initialMachine(alloc, program_forms, seed, init_env);
+    var X = std.StringHashMap(Value).init(alloc);
+    var S = std.StringHashMap(f64).init(alloc);
+    var O = std.StringHashMap(f64).init(alloc);
+    while (true) {
+        const msg = try stepMachine(m);
+        switch (msg) {
+            .done => |val| {
+                return TraceRunResult{ .value = val, .X = X, .S = S, .O = O };
+            },
+            .sample => |s| {
+                const a_str = try addrToString(alloc, s.addr);
+                const should_redraw = if (x0_str) |x0| std.mem.eql(u8, a_str, x0) else true;
+                var x: Value = undefined;
+                if (should_redraw or !cache.contains(a_str)) {
+                    x = s.d.sample(m.rng.random());
+                } else {
+                    x = cache.get(a_str).?;
+                }
+                try X.put(a_str, x);
+                try S.put(a_str, s.d.logProb(x));
+                try m.send(x);
+            },
+            .observe => |o| {
+                const a_str = try addrToString(alloc, o.addr);
+                const lp = o.d.logProb(o.y);
+                try O.put(a_str, lp);
+                try m.send(o.y);
+            },
+        }
+    }
+}
+
+pub fn runMH(alloc: Allocator, program_forms: []const Value, seed: u64, init_env: Env, steps: usize, warmup: usize) ![]Value {
+    var rng = std.Random.DefaultPrng.init(seed);
+    const r_rand = rng.random();
+
+    var current = try runTrace(alloc, program_forms, r_rand.int(u64), init_env, null, std.StringHashMap(Value).init(alloc));
+
+    var chain: std.ArrayList(Value) = .empty;
+    errdefer chain.deinit(alloc);
+
+    const total_steps = steps + warmup;
+    for (0..total_steps) |i| {
+        if (current.X.count() == 0) {
+            if (i >= warmup) try chain.append(alloc, current.value);
+            continue;
+        }
+
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(alloc);
+        var it = current.X.keyIterator();
+        while (it.next()) |k| {
+            try keys.append(alloc, k.*);
+        }
+
+        const idx = r_rand.uintLessThan(usize, keys.items.len);
+        const a0 = keys.items[idx];
+
+        var proposed = try runTrace(alloc, program_forms, r_rand.int(u64), init_env, a0, current.X);
+
+        var num: f64 = 0.0;
+        var o2_it = proposed.O.valueIterator();
+        while (o2_it.next()) |p| {
+            num += p.*;
+        }
+
+        var s2_it = proposed.S.iterator();
+        while (s2_it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const p = entry.value_ptr.*;
+            const in_fwd = std.mem.eql(u8, k, a0) or !current.X.contains(k);
+            if (!in_fwd) {
+                num += p;
+            }
+        }
+
+        var den: f64 = 0.0;
+        var o_it = current.O.valueIterator();
+        while (o_it.next()) |p| {
+            den += p.*;
+        }
+
+        var s_it = current.S.iterator();
+        while (s_it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const p = entry.value_ptr.*;
+            const in_rev = std.mem.eql(u8, k, a0) or !proposed.X.contains(k);
+            if (!in_rev) {
+                den += p;
+            }
+        }
+
+        const n_old = @as(f64, @floatFromInt(current.X.count()));
+        const n_new = @as(f64, @floatFromInt(proposed.X.count()));
+        const log_alpha = (@log(n_old) - @log(n_new)) + (num - den);
+
+        if (@log(r_rand.float(f64)) < log_alpha) {
+            current = proposed;
+        }
+
+        if (i >= warmup) {
+            try chain.append(alloc, current.value);
+        }
+    }
+    return try chain.toOwnedSlice(alloc);
+}
 
 // Helper functions / Setup
 
@@ -373,8 +512,6 @@ fn isTruthy(val: Value) bool {
         else => true,
     };
 }
-
-
 
 const primitives = @import("primitives.zig");
 pub fn createGlobalEnv(alloc: Allocator) !Env {
