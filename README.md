@@ -10,10 +10,11 @@ with
 + dynamic control flow
 
 = TODO
-- [ ] 19/6
+- [x] 19/6
 - [ ] 22/6
 - [ ] 24/6
 - [ ] 26/6
+
 ---
 - [ ] 29/6
 - [ ] Maybe some optimization on comptime?
