@@ -14,18 +14,18 @@ pub fn main(init: std.process.Init) !void {
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_impl = std.Io.File.stdout().writer(io, &stdout_buf);
-    const stdout_writer = &stdout_impl.interface;
+    const writer = &stdout_impl.interface;
 
     var stdin_buf: [1024]u8 = undefined;
     var stdin_impl = std.Io.File.stdin().reader(io, &stdin_buf);
-    const stdin_reader = &stdin_impl.interface;
+    const reader = &stdin_impl.interface;
 
-    try stdout_writer.print("Welcome to the ZPPL REPL.\n", .{});
-    try stdout_writer.print("Commands:\n", .{});
-    try stdout_writer.print("  /lw          - Switch to Likelihood Weighting (Default)\n", .{});
-    try stdout_writer.print("  /smc         - Switch to Sequential Monte Carlo (N=100)\n", .{});
-    try stdout_writer.print("  /mh          - Switch to Metropolis-Hastings (2000 steps)\n", .{});
-    try stdout_writer.print("  (Type inline commands like `/mh <expr>` to run once and switch)\n\n", .{});
+    try writer.print("Welcome to the ZPPL REPL.\n", .{});
+    try writer.print("Commands:\n", .{});
+    try writer.print("  /lw          - Switch to Likelihood Weighting\n", .{});
+    try writer.print("  /smc         - Switch to Sequential Monte Carlo\n", .{});
+    try writer.print("  /mh          - Switch to Metropolis-Hastings\n", .{});
+    try writer.print("  (Type inline commands like `/mh <expr>` to run once and switch)\n\n", .{});
 
     var mode: enum { lw, smc, mh } = .lw;
 
@@ -35,8 +35,8 @@ pub fn main(init: std.process.Init) !void {
             .smc => "smc",
             .mh => "mh",
         };
-        try stdout_writer.print("[{s}]> ", .{mode_symbol});
-        try stdout_writer.flush();
+        try writer.print("[{s}]> ", .{mode_symbol});
+        try writer.flush();
 
         var temp_arena = std.heap.ArenaAllocator.init(arena);
         defer temp_arena.deinit();
@@ -48,12 +48,12 @@ pub fn main(init: std.process.Init) !void {
         var eof = false;
 
         while (true) {
-            const char = stdin_reader.takeByte() catch |err| {
+            const char = reader.takeByte() catch |err| {
                 if (err == error.EndOfStream) {
                     eof = true;
                     break;
                 }
-                try stdout_writer.print("Read error: {s}\n", .{@errorName(err)});
+                try writer.print("Read error: {s}\n", .{@errorName(err)});
                 break;
             };
             if (char == '\n') break;
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
 
         const trimmed = std.mem.trim(u8, input_buf.items, " \t\r\n");
         if (std.mem.eql(u8, trimmed, "quit") or eof) {
-            try stdout_writer.print("Exiting REPL...\n", .{});
+            try writer.print("Exiting REPL...\n", .{});
             break;
         }
 
@@ -92,12 +92,12 @@ pub fn main(init: std.process.Init) !void {
                     .smc => "Sequential Monte Carlo",
                     .mh => "Metropolis-Hastings",
                 };
-                try stdout_writer.print("Mode changed to: {s}\n", .{mode_name});
+                try writer.print("Mode changed to: {s}\n", .{mode_name});
                 continue;
             }
 
             const parsed_forms = parser.parse(temp_alloc, rest_input) catch |err| {
-                try stdout_writer.print("Parse error: {s}\n", .{@errorName(err)});
+                try writer.print("Parse error: {s}\n", .{@errorName(err)});
                 continue;
             };
 
@@ -106,10 +106,10 @@ pub fn main(init: std.process.Init) !void {
             switch (mode) {
                 .lw => {
                     const result = machine.runLW(temp_alloc, parsed_forms, 42, env) catch |err| {
-                        try stdout_writer.print("LW Runtime error: {s}\n", .{@errorName(err)});
+                        try writer.print("LW Runtime error: {s}\n", .{@errorName(err)}); // TODO: improve error types
                         continue;
                     };
-                    try stdout_writer.print("Result: {f}, Log-Weight: {d}\n", .{ result[0], result[1] });
+                    try writer.print("Result: {f}, Log-Weight: {d}\n", .{ result[0], result[1] });
                 },
                 .smc => {
                     const N = 100;
@@ -118,14 +118,14 @@ pub fn main(init: std.process.Init) !void {
                     for (0..N) |i| seeds[i] = seed_rng.random().int(u64);
 
                     const results = machine.runSMC(temp_alloc, parsed_forms, seeds, env, N) catch |err| {
-                        try stdout_writer.print("SMC Runtime error: {s}\n", .{@errorName(err)});
+                        try writer.print("SMC Runtime error: {s}\n", .{@errorName(err)});
                         continue;
                     };
 
-                    try stdout_writer.print("Run complete with {d} particles.\nFirst 5 samples: ", .{N});
+                    try writer.print("Run complete with {d} particles.\nFirst 5 samples: ", .{N});
                     for (0..@min(N, 5)) |i| {
-                        if (i > 0) try stdout_writer.print(", ", .{});
-                        try stdout_writer.print("{f}", .{results[i]});
+                        if (i > 0) try writer.print(", ", .{});
+                        try writer.print("{f}", .{results[i]});
                     }
 
                     var sum: f64 = 0.0;
@@ -144,9 +144,9 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                     if (numeric_count > 0) {
-                        try stdout_writer.print("\nEmpirical Posterior Mean: {d:.4}\n", .{sum / @as(f64, @floatFromInt(numeric_count))});
+                        try writer.print("\nEmpirical Posterior Mean: {d:.4}\n", .{sum / @as(f64, @floatFromInt(numeric_count))});
                     } else {
-                        try stdout_writer.print("\n", .{});
+                        try writer.print("\n", .{});
                     }
                 },
                 .mh => {
@@ -188,7 +188,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try stdout_writer.flush();
+    try writer.flush();
 }
 
 
