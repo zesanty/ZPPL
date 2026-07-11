@@ -17,6 +17,44 @@ pub const AddrTag = enum { let, body, test_tag, then, els, fn_tag, arg, d, v };
 pub const AddrItem = union(AddrTag) { let: usize, body: usize, test_tag: void, then: void, els: void, fn_tag: void, arg: usize, d: void, v: void };
 pub const Addr = []const AddrItem;
 
+pub const AddrContext = struct {
+    pub fn hash(self: AddrContext, key: Addr) u64 {
+        _ = self;
+        var hasher = std.hash.Wyhash.init(0);
+        for (key) |item| {
+            const tag = @as(AddrTag, item);
+            hasher.update(std.mem.asBytes(&tag));
+            switch (item) {
+                .let => |v| hasher.update(std.mem.asBytes(&v)),
+                .body => |v| hasher.update(std.mem.asBytes(&v)),
+                .arg => |v| hasher.update(std.mem.asBytes(&v)),
+                else => {},
+            }
+        }
+        return hasher.final();
+    }
+
+    pub fn eql(self: AddrContext, a: Addr, b: Addr) bool {
+        _ = self;
+        if (a.len != b.len) return false;
+        for (a, b) |item_a, item_b| {
+            const tag_a = @as(AddrTag, item_a);
+            const tag_b = @as(AddrTag, item_b);
+            if (tag_a != tag_b) return false;
+            switch (item_a) {
+                .let => |v| if (v != item_b.let) return false,
+                .body => |v| if (v != item_b.body) return false,
+                .arg => |v| if (v != item_b.arg) return false,
+                else => {},
+            }
+        }
+        return true;
+    }
+};
+
+pub const AddrValueMap = std.HashMap(Addr, Value, AddrContext, std.hash_map.default_max_load_percentage);
+pub const AddrFloatMap = std.HashMap(Addr, f64, AddrContext, std.hash_map.default_max_load_percentage);
+
 pub const InstrTag = enum { ev, letk, ifk, discard, callk, samplek, observek };
 pub const MachineInstr = union(InstrTag) {
     ev: struct { e: Value, env: Env, addr: Addr },
@@ -92,20 +130,18 @@ fn extendAddr(alloc: Allocator, base: Addr, tag: AddrItem) !Addr {
 }
 
 fn pushBody(alloc: Allocator, C: *std.ArrayList(MachineInstr), body: []const Value, env: Env, addr: Addr) !void {
-    var seq: std.ArrayList(MachineInstr) = .empty;
-    defer seq.deinit(alloc);
+    if (body.len == 0) return;
 
-    var n: usize = 0;
-    while (n < body.len - 1) : (n += 1) {
-        try seq.append(alloc, .{ .ev = .{ .e = body[n], .env = env, .addr = try extendAddr(alloc, addr, .{ .body = n }) } });
-        try seq.append(alloc, .discard);
-    }
-    try seq.append(alloc, .{ .ev = .{ .e = body[body.len - 1], .env = env, .addr = try extendAddr(alloc, addr, .{ .body = body.len - 1 }) } });
+    const last_idx = body.len - 1;
+    const last_addr = try extendAddr(alloc, addr, .{ .body = last_idx });
+    try C.append(alloc, .{ .ev = .{ .e = body[last_idx], .env = env, .addr = last_addr } });
 
-    var i: usize = seq.items.len;
-    while (i > 0) {
-        i -= 1;
-        try C.append(alloc, seq.items[i]);
+    var idx = last_idx;
+    while (idx > 0) {
+        idx -= 1;
+        try C.append(alloc, .discard);
+        const expr_addr = try extendAddr(alloc, addr, .{ .body = idx });
+        try C.append(alloc, .{ .ev = .{ .e = body[idx], .env = env, .addr = expr_addr } });
     }
 }
 
@@ -121,8 +157,6 @@ pub fn stepMachine(machine: *Machine) !MachineMessage {
                         if (ev.env.get(s)) |val| {
                             try machine.V.append(alloc, val);
                         } else {
-                            // #TODO should use our own error sets
-                            // FIX: Return standard error instead of panicking
                             return error.NameError;
                         }
                     },
@@ -268,7 +302,7 @@ pub fn initialMachine(alloc: Allocator, program_forms: []const Value, seed: u64,
 }
 
 // ---------------------------------------------------------
-//Likelihood Weighting
+// Likelihood Weighting
 // ---------------------------------------------------------
 pub fn runLW(alloc: Allocator, program_forms: []const Value, seed: u64, init_env: Env) !struct { Value, f64 } {
     const m = try initialMachine(alloc, program_forms, seed, init_env);
@@ -284,8 +318,9 @@ pub fn runLW(alloc: Allocator, program_forms: []const Value, seed: u64, init_env
         }
     }
 }
+
 // ---------------------------------------------------------
-//Sequential Monte Carlo
+// Sequential Monte Carlo
 // ---------------------------------------------------------
 pub fn advance(m: *Machine) !MachineMessage {
     var msg = try stepMachine(m);
@@ -360,42 +395,22 @@ pub fn runSMC(alloc: Allocator, program_forms: []const Value, seeds: []const u64
         particles = next_particles;
     }
 }
+
 // ---------------------------------------------------------
 // Single-Site Metropolis-Hastings
 // ---------------------------------------------------------
 pub const TraceRunResult = struct {
     value: Value,
-    X: std.StringHashMap(Value),
-    S: std.StringHashMap(f64),
-    O: std.StringHashMap(f64),
+    X: AddrValueMap,
+    S: AddrFloatMap,
+    O: AddrFloatMap,
 };
 
-fn addrToString(alloc: Allocator, addr: Addr) ![]const u8 {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(alloc);
-    for (addr) |item| {
-        var buf: [32]u8 = undefined;
-        const slice = switch (item) {
-            .let => |v| try std.fmt.bufPrint(&buf, "let:{d}/", .{v}),
-            .body => |v| try std.fmt.bufPrint(&buf, "body:{d}/", .{v}),
-            .test_tag => "test/",
-            .then => "then/",
-            .els => "els/",
-            .fn_tag => "fn/",
-            .arg => |v| try std.fmt.bufPrint(&buf, "arg:{d}/", .{v}),
-            .d => "d/",
-            .v => "v/",
-        };
-        try list.appendSlice(alloc, slice);
-    }
-    return try list.toOwnedSlice(alloc);
-}
-
-pub fn runTrace(alloc: Allocator, program_forms: []const Value, seed: u64, init_env: Env, x0_str: ?[]const u8, cache: std.StringHashMap(Value)) !TraceRunResult {
+pub fn runTrace(alloc: Allocator, program_forms: []const Value, seed: u64, init_env: Env, x0: ?Addr, cache: AddrValueMap) !TraceRunResult {
     const m = try initialMachine(alloc, program_forms, seed, init_env);
-    var X = std.StringHashMap(Value).init(alloc);
-    var S = std.StringHashMap(f64).init(alloc);
-    var O = std.StringHashMap(f64).init(alloc);
+    var X = AddrValueMap.init(alloc);
+    var S = AddrFloatMap.init(alloc);
+    var O = AddrFloatMap.init(alloc);
     while (true) {
         const msg = try stepMachine(m);
         switch (msg) {
@@ -403,22 +418,22 @@ pub fn runTrace(alloc: Allocator, program_forms: []const Value, seed: u64, init_
                 return TraceRunResult{ .value = val, .X = X, .S = S, .O = O };
             },
             .sample => |s| {
-                const a_str = try addrToString(alloc, s.addr);
-                const should_redraw = if (x0_str) |x0| std.mem.eql(u8, a_str, x0) else true;
+                const addr = s.addr;
+                const should_redraw = if (x0) |x0_addr| AddrContext.eql(.{}, addr, x0_addr) else true;
                 var x: Value = undefined;
-                if (should_redraw or !cache.contains(a_str)) {
+                if (should_redraw or !cache.contains(addr)) {
                     x = s.d.sample(m.rng.random());
                 } else {
-                    x = cache.get(a_str).?;
+                    x = cache.get(addr).?;
                 }
-                try X.put(a_str, x);
-                try S.put(a_str, s.d.logProb(x));
+                try X.put(addr, x);
+                try S.put(addr, s.d.logProb(x));
                 try m.send(x);
             },
             .observe => |o| {
-                const a_str = try addrToString(alloc, o.addr);
+                const addr = o.addr;
                 const lp = o.d.logProb(o.y);
-                try O.put(a_str, lp);
+                try O.put(addr, lp);
                 try m.send(o.y);
             },
         }
@@ -429,7 +444,7 @@ pub fn runMH(alloc: Allocator, program_forms: []const Value, seed: u64, init_env
     var rng = std.Random.DefaultPrng.init(seed);
     const r_rand = rng.random();
 
-    var current = try runTrace(alloc, program_forms, r_rand.int(u64), init_env, null, std.StringHashMap(Value).init(alloc));
+    var current = try runTrace(alloc, program_forms, r_rand.int(u64), init_env, null, AddrValueMap.init(alloc));
 
     var chain: std.ArrayList(Value) = .empty;
     errdefer chain.deinit(alloc);
@@ -441,7 +456,7 @@ pub fn runMH(alloc: Allocator, program_forms: []const Value, seed: u64, init_env
             continue;
         }
 
-        var keys: std.ArrayList([]const u8) = .empty;
+        var keys: std.ArrayList(Addr) = .empty;
         defer keys.deinit(alloc);
         var it = current.X.keyIterator();
         while (it.next()) |k| {
@@ -463,7 +478,8 @@ pub fn runMH(alloc: Allocator, program_forms: []const Value, seed: u64, init_env
         while (s2_it.next()) |entry| {
             const k = entry.key_ptr.*;
             const p = entry.value_ptr.*;
-            const in_fwd = std.mem.eql(u8, k, a0) or !current.X.contains(k);
+            const is_resampled = AddrContext.eql(.{}, k, a0);
+            const in_fwd = is_resampled or !current.X.contains(k);
             if (!in_fwd) {
                 num += p;
             }
@@ -479,7 +495,8 @@ pub fn runMH(alloc: Allocator, program_forms: []const Value, seed: u64, init_env
         while (s_it.next()) |entry| {
             const k = entry.key_ptr.*;
             const p = entry.value_ptr.*;
-            const in_rev = std.mem.eql(u8, k, a0) or !proposed.X.contains(k);
+            const is_resampled = AddrContext.eql(.{}, k, a0);
+            const in_rev = is_resampled or !proposed.X.contains(k);
             if (!in_rev) {
                 den += p;
             }
@@ -500,9 +517,7 @@ pub fn runMH(alloc: Allocator, program_forms: []const Value, seed: u64, init_env
     return try chain.toOwnedSlice(alloc);
 }
 
-// Helper functions / Setup
-
-// Helper to correctly resolve Lisp/Python-style truthiness... kind of sure it works.
+// Helper to correctly resolve Lisp/Python-style truthiness
 fn isTruthy(val: Value) bool {
     return switch (val) {
         .Nil => false,
@@ -519,7 +534,9 @@ pub fn createGlobalEnv(alloc: Allocator) !Env {
     env.* = std.StringHashMap(Value).init(alloc);
     try env.put("+", Value{ .Primitive = primitives.primAdd });
     try env.put("-", Value{ .Primitive = primitives.primSubtract });
+    try env.put("*", Value{ .Primitive = primitives.primMul });
     try env.put("normal", Value{ .Primitive = primitives.primNormal });
     try env.put("bernoulli", Value{ .Primitive = primitives.primBernoulli });
+
     return env;
 }
