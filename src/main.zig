@@ -1,20 +1,158 @@
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
 
 const parser = @import("parser.zig");
 const machine = @import("machine.zig");
 
-pub fn main(init: std.process.Init) !void {
-    const arena: std.mem.Allocator = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+const has_posix = builtin.os.tag != .windows and builtin.os.tag != .wasi;
+
+const TermRawMode = struct {
+    original: if (has_posix) std.posix.termios else void = if (has_posix) undefined else {},
+    active: bool = false,
+
+    pub fn enable() TermRawMode {
+        var self = TermRawMode{};
+        if (has_posix) {
+            if (std.posix.tcgetattr(0)) |orig| {
+                self.original = orig;
+                var raw = orig;
+                raw.lflag.ICANON = false;
+                raw.lflag.ECHO = false;
+                if (std.posix.tcsetattr(0, .NOW, raw)) |_| {
+                    self.active = true;
+                } else |_| {}
+            } else |_| {}
+        }
+        return self;
     }
+
+    pub fn disable(self: *TermRawMode) void {
+        if (has_posix and self.active) {
+            _ = std.posix.tcsetattr(0, .NOW, self.original) catch {};
+            self.active = false;
+        }
+    }
+};
+
+fn printValue(writer: *std.Io.Writer, val: Value) !void {
+    try val.format(writer);
+}
+
+fn printSamplesAndPosterior(writer: *std.Io.Writer, samples: []const Value, k: u8) !void {
+    const clamped_k = @min(samples.len, k);
+    try writer.print("First {d} samples: ", .{clamped_k});
+    for (0..clamped_k) |i| {
+        if (i > 0) try writer.print(", ", .{});
+        try printValue(writer, samples[i]);
+    }
+
+    var sum: f64 = 0.0;
+    var numeric_count: usize = 0;
+    for (samples) |res| {
+        switch (res) {
+            .Float => |f| {
+                sum += f;
+                numeric_count += 1;
+            },
+            .Int => |i| {
+                sum += @floatFromInt(i);
+                numeric_count += 1;
+            },
+            else => {},
+        }
+    }
+    if (numeric_count > 0) {
+        try writer.print("\nEmpirical Posterior Mean: {d:.4}\n", .{sum / @as(f64, @floatFromInt(numeric_count))});
+    } else {
+        try writer.print("\n", .{});
+    }
+}
+
+fn runAndPrintLW(alloc: std.mem.Allocator, forms: []const Value, env: machine.Env, writer: *std.Io.Writer, seed: u64) !void {
+    const result = try machine.runLW(alloc, forms, seed, env);
+    try writer.print("Result: ", .{});
+    try printValue(writer, result[0]);
+    try writer.print(", Log-Weight: {d}\n", .{result[1]});
+}
+
+fn runAndPrintSMC(alloc: std.mem.Allocator, forms: []const Value, env: machine.Env, writer: *std.Io.Writer, seed: u64) !void {
+    const N = 1000;
+    var seeds = try alloc.alloc(u64, N);
+    var seed_rng = std.Random.DefaultPrng.init(seed);
+    for (0..N) |i| seeds[i] = seed_rng.random().int(u64);
+
+    const results = try machine.runSMC(alloc, forms, seeds, env, N);
+    try writer.print("Run complete with {d} particles.\n", .{N});
+    try printSamplesAndPosterior(writer, results, 14);
+}
+
+fn runAndPrintMH(alloc: std.mem.Allocator, forms: []const Value, env: machine.Env, writer: *std.Io.Writer, seed: u64) !void {
+    const steps = 20000;
+    const warmup = 1000;
+    const chain = try machine.runMH(alloc, forms, seed, env, steps, warmup);
+    try writer.print("Run complete ({d} samples, {d} warmup).\n", .{ steps, warmup });
+    try printSamplesAndPosterior(writer, chain, 45);
+}
+
+// Clears the current terminal line, rewrites the prompt + buffer, and positions the cursor
+fn refreshLine(writer: *std.Io.Writer, mode_symbol: []const u8, buf: []const u8, pos: usize) !void {
+    try writer.print("\r\x1b[2K[{s}]> {s}", .{ mode_symbol, buf });
+    const left_moves = buf.len - pos;
+    if (left_moves > 0) {
+        for (0..left_moves) |_| {
+            try writer.writeAll("\x1b[D");
+        }
+    }
+    try writer.flush();
+}
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
     const io = init.io;
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_impl = std.Io.File.stdout().writer(io, &stdout_buf);
     const writer = &stdout_impl.interface;
+
+    var file_path: ?[]const u8 = null;
+    var mode: enum { lw, smc, mh } = .mh;
+    var seed: u64 = 42;
+    var next_is_seed = false;
+
+    for (args, 0..) |arg, idx| {
+        if (idx == 0) continue;
+
+        if (next_is_seed) {
+            seed = try std.fmt.parseInt(u64, arg, 10);
+            next_is_seed = false;
+        } else if (std.mem.eql(u8, arg, "--lw")) {
+            mode = .lw;
+        } else if (std.mem.eql(u8, arg, "--smc")) {
+            mode = .smc;
+        } else if (std.mem.eql(u8, arg, "--mh")) {
+            mode = .mh;
+        } else if (std.mem.eql(u8, arg, "--seed") or std.mem.eql(u8, arg, "-s")) {
+            next_is_seed = true;
+        } else {
+            if (file_path == null) file_path = arg;
+        }
+    }
+
+    if (file_path) |path| {
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
+        const parsed_forms = try parser.parse(arena, content);
+        const env = try machine.createGlobalEnv(arena);
+
+        switch (mode) {
+            .lw => try runAndPrintLW(arena, parsed_forms, env, writer, seed),
+            .smc => try runAndPrintSMC(arena, parsed_forms, env, writer, seed),
+            .mh => try runAndPrintMH(arena, parsed_forms, env, writer, seed),
+        }
+        try writer.flush();
+        return;
+    }
 
     var stdin_buf: [1024]u8 = undefined;
     var stdin_impl = std.Io.File.stdin().reader(io, &stdin_buf);
@@ -25,12 +163,20 @@ pub fn main(init: std.process.Init) !void {
     try writer.print("  /lw          - Switch to Likelihood Weighting\n", .{});
     try writer.print("  /smc         - Switch to Sequential Monte Carlo\n", .{});
     try writer.print("  /mh          - Switch to Metropolis-Hastings\n", .{});
-    try writer.print("  (Type inline commands like `/mh <expr>` to run once and switch)\n\n", .{});
+    try writer.print("  /seed <num>  - Set or inspect random seed for REPL evaluations\n\n", .{});
+    try writer.print("  /quit         - To quit\n", .{});
 
-    var mode: enum { lw, smc, mh } = .lw;
+    var repl_mode: enum { lw, smc, mh } = .lw;
+    var repl_seed: u64 = 0;
+
+    var raw_mode = TermRawMode.enable();
+    defer raw_mode.disable();
+
+    var history: std.ArrayList([]const u8) = .empty;
+    defer history.deinit(arena);
 
     while (true) {
-        const mode_symbol = switch (mode) {
+        const mode_symbol = switch (repl_mode) {
             .lw => "lw",
             .smc => "smc",
             .mh => "mh",
@@ -46,19 +192,119 @@ pub fn main(init: std.process.Init) !void {
         defer input_buf.deinit(temp_alloc);
 
         var eof = false;
+        var history_index: usize = history.items.len;
+        var cursor_pos: usize = 0;
 
-        while (true) {
-            const char = reader.takeByte() catch |err| {
-                if (err == error.EndOfStream) {
+        if (!raw_mode.active) {
+            while (true) {
+                const char = reader.takeByte() catch |err| {
+                    if (err == error.EndOfStream) {
+                        eof = true;
+                        break;
+                    }
+                    return err;
+                };
+                if (char == '\n') break;
+                if (char != '\r') try input_buf.append(temp_alloc, char);
+            }
+        } else {
+            while (true) {
+                const char = reader.takeByte() catch |err| {
+                    if (err == error.EndOfStream) {
+                        eof = true;
+                        break;
+                    }
+                    return err;
+                };
+
+                if (char == '\n' or char == '\r') {
+                    try writer.writeAll("\r\n");
+                    try writer.flush();
+                    break;
+                } else if (char == 127 or char == 8) { // Backspace
+                    if (cursor_pos > 0) {
+                        _ = input_buf.orderedRemove(cursor_pos - 1);
+                        cursor_pos -= 1;
+                        try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                    }
+                } else if (char == 3) { // Ctrl+C
+                    try writer.writeAll("^C\r\n");
+                    try writer.flush();
+                    input_buf.clearRetainingCapacity();
+                    cursor_pos = 0;
+                    break;
+                } else if (char == 4) { // Ctrl+D
                     eof = true;
                     break;
+                } else if (char == '\x1b') { // Escape sequence
+                    const next1 = reader.takeByte() catch '\x00';
+                    const next2 = reader.takeByte() catch '\x00';
+                    if (next1 == '[') {
+                        if (next2 == 'A') { // Up Arrow (History Prev)
+                            if (history.items.len > 0 and history_index > 0) {
+                                history_index -= 1;
+                                const cmd = history.items[history_index];
+                                input_buf.clearRetainingCapacity();
+                                try input_buf.appendSlice(temp_alloc, cmd);
+                                cursor_pos = cmd.len;
+                                try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                            }
+                        } else if (next2 == 'B') { // Down Arrow (History Next)
+                            if (history.items.len > 0 and history_index < history.items.len) {
+                                history_index += 1;
+                                if (history_index == history.items.len) {
+                                    input_buf.clearRetainingCapacity();
+                                    cursor_pos = 0;
+                                    try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                                } else {
+                                    const cmd = history.items[history_index];
+                                    input_buf.clearRetainingCapacity();
+                                    try input_buf.appendSlice(temp_alloc, cmd);
+                                    cursor_pos = cmd.len;
+                                    try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                                }
+                            }
+                        } else if (next2 == 'C') { // Right Arrow
+                            if (cursor_pos < input_buf.items.len) {
+                                cursor_pos += 1;
+                                try writer.writeAll("\x1b[C");
+                                try writer.flush();
+                            }
+                        } else if (next2 == 'D') { // Left Arrow
+                            if (cursor_pos > 0) {
+                                cursor_pos -= 1;
+                                try writer.writeAll("\x1b[D");
+                                try writer.flush();
+                            }
+                        } else if (next2 == '3') { // Delete Key Sequence (\x1b[3~)
+                            const next3 = reader.takeByte() catch '\x00';
+                            if (next3 == '~') {
+                                if (cursor_pos < input_buf.items.len) {
+                                    _ = input_buf.orderedRemove(cursor_pos);
+                                    try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                                }
+                            }
+                        } else if (next2 == 'H') { // Home Key (\x1b[H)
+                            cursor_pos = 0;
+                            try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                        } else if (next2 == 'F') { // End Key (\x1b[F)
+                            cursor_pos = input_buf.items.len;
+                            try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                        }
+                    } else if (next1 == 'O') { // Alternatives for Home/End (e.g., \x1bOH, \x1bOF)
+                        if (next2 == 'H') {
+                            cursor_pos = 0;
+                            try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                        } else if (next2 == 'F') {
+                            cursor_pos = input_buf.items.len;
+                            try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
+                        }
+                    }
+                } else if (char >= 32 and char <= 126) { // Printable characters
+                    try input_buf.insert(temp_alloc, cursor_pos, char);
+                    cursor_pos += 1;
+                    try refreshLine(writer, mode_symbol, input_buf.items, cursor_pos);
                 }
-                try writer.print("Read error: {s}\n", .{@errorName(err)});
-                break;
-            };
-            if (char == '\n') break;
-            if (char != '\r') {
-                try input_buf.append(temp_alloc, char);
             }
         }
 
@@ -69,25 +315,39 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (trimmed.len > 0) {
+            if (history.items.len == 0 or !std.mem.eql(u8, history.items[history.items.len - 1], trimmed)) {
+                const duped = try arena.dupe(u8, trimmed);
+                try history.append(arena, duped);
+            }
+
             var rest_input = trimmed;
             var command_only = false;
 
             if (std.mem.startsWith(u8, trimmed, "/lw")) {
-                mode = .lw;
+                repl_mode = .lw;
                 rest_input = std.mem.trim(u8, trimmed[3..], " \t\r\n");
                 if (rest_input.len == 0) command_only = true;
             } else if (std.mem.startsWith(u8, trimmed, "/smc")) {
-                mode = .smc;
+                repl_mode = .smc;
                 rest_input = std.mem.trim(u8, trimmed[4..], " \t\r\n");
                 if (rest_input.len == 0) command_only = true;
             } else if (std.mem.startsWith(u8, trimmed, "/mh")) {
-                mode = .mh;
+                repl_mode = .mh;
                 rest_input = std.mem.trim(u8, trimmed[3..], " \t\r\n");
                 if (rest_input.len == 0) command_only = true;
+            } else if (std.mem.startsWith(u8, trimmed, "/seed")) {
+                const seed_str = std.mem.trim(u8, trimmed[5..], " \t\r\n");
+                if (seed_str.len == 0) {
+                    try writer.print("Current seed is: {d}\n", .{repl_seed});
+                } else {
+                    repl_seed = try std.fmt.parseInt(u64, seed_str, 10);
+                    try writer.print("Seed changed to: {d}\n", .{repl_seed});
+                }
+                continue;
             }
 
             if (command_only) {
-                const mode_name = switch (mode) {
+                const mode_name = switch (repl_mode) {
                     .lw => "Likelihood Weighting",
                     .smc => "Sequential Monte Carlo",
                     .mh => "Metropolis-Hastings",
@@ -96,104 +356,21 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             }
 
-            const parsed_forms = parser.parse(temp_alloc, rest_input) catch |err| {
-                try writer.print("Parse error: {s}\n", .{@errorName(err)});
-                continue;
-            };
-
+            const parsed_forms = try parser.parse(temp_alloc, rest_input);
             const env = try machine.createGlobalEnv(temp_alloc);
 
-            switch (mode) {
-                .lw => {
-                    const result = machine.runLW(temp_alloc, parsed_forms, 42, env) catch |err| {
-                        try writer.print("LW Runtime error: {s}\n", .{@errorName(err)}); // TODO: improve error types
-                        continue;
-                    };
-                    try writer.print("Result: {f}, Log-Weight: {d}\n", .{ result[0], result[1] });
-                },
-                .smc => {
-                    const N = 100;
-                    var seeds = try temp_alloc.alloc(u64, N);
-                    var seed_rng = std.Random.DefaultPrng.init(42);
-                    for (0..N) |i| seeds[i] = seed_rng.random().int(u64);
-
-                    const results = machine.runSMC(temp_alloc, parsed_forms, seeds, env, N) catch |err| {
-                        try writer.print("SMC Runtime error: {s}\n", .{@errorName(err)});
-                        continue;
-                    };
-
-                    try writer.print("Run complete with {d} particles.\nFirst 5 samples: ", .{N});
-                    for (0..@min(N, 5)) |i| {
-                        if (i > 0) try writer.print(", ", .{});
-                        try writer.print("{f}", .{results[i]});
-                    }
-
-                    var sum: f64 = 0.0;
-                    var numeric_count: usize = 0;
-                    for (results) |res| {
-                        switch (res) {
-                            .Float => |f| {
-                                sum += f;
-                                numeric_count += 1;
-                            },
-                            .Int => |i| {
-                                sum += @floatFromInt(i);
-                                numeric_count += 1;
-                            },
-                            else => {},
-                        }
-                    }
-                    if (numeric_count > 0) {
-                        try writer.print("\nEmpirical Posterior Mean: {d:.4}\n", .{sum / @as(f64, @floatFromInt(numeric_count))});
-                    } else {
-                        try writer.print("\n", .{});
-                    }
-                },
-                .mh => {
-                    const steps = 10000; // #TODO: should be a config
-                    const warmup = 1000;
-                    const chain = machine.runMH(temp_alloc, parsed_forms, 42, env, steps, warmup) catch |err| {
-                        try writer.print("MH Runtime error: {s}\n", .{@errorName(err)});
-                        continue;
-                    };
-
-                    try writer.print("Run complete ({d} samples, {d} warmup).\nFirst 5 samples: ", .{ steps, warmup });
-                    for (0..@min(chain.len, 5)) |i| {
-                        if (i > 0) try writer.print(", ", .{});
-                        try writer.print("{f}", .{chain[i]});
-                    }
-
-                    var sum: f64 = 0.0;
-                    var numeric_count: usize = 0;
-                    for (chain) |res| {
-                        switch (res) {
-                            .Float => |f| {
-                                sum += f;
-                                numeric_count += 1;
-                            },
-                            .Int => |i| {
-                                sum += @floatFromInt(i);
-                                numeric_count += 1;
-                            },
-                            else => {},
-                        }
-                    }
-                    if (numeric_count > 0) {
-                        try writer.print("\nEmpirical Posterior Mean: {d:.4}\n", .{sum / @as(f64, @floatFromInt(numeric_count))});
-                    } else {
-                        try writer.print("\n", .{});
-                    }
-                },
+            switch (repl_mode) {
+                .lw => runAndPrintLW(temp_alloc, parsed_forms, env, writer, repl_seed) catch {},
+                .smc => runAndPrintSMC(temp_alloc, parsed_forms, env, writer, repl_seed) catch {},
+                .mh => runAndPrintMH(temp_alloc, parsed_forms, env, writer, repl_seed) catch {},
             }
         }
     }
-
     try writer.flush();
 }
 
 const ValueTag = parser.ValueTag;
 const Value = parser.Value;
-
 // TEST SUITE
 
 test "closure test example" {
@@ -300,7 +477,6 @@ test "bits MCMC test" {
     }
     const mean = sum / @as(f64, @floatFromInt(numeric_count));
 
-    // Verify convergence to the exact analytical posterior within statistical margin
     try std.testing.expect(mean >= exact_mean - 0.05 and mean <= exact_mean + 0.05);
 }
 
@@ -437,19 +613,6 @@ test "Eval Closure" {
     try std.testing.expectEqual(@as(f64, 15.0), result[0].Float);
 }
 
-fn primMul(alloc: std.mem.Allocator, args: []const Value) !Value {
-    _ = alloc;
-    var prod: f64 = 1.0;
-    for (args) |a| {
-        prod *= switch (a) {
-            .Float => |f| f,
-            .Int => |i| @floatFromInt(i),
-            else => 1.0,
-        };
-    }
-    return Value{ .Float = prod };
-}
-
 test "Eval HOF" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -458,7 +621,6 @@ test "Eval HOF" {
 
     const parsed = try parser.parse(alloc, "(let [apply (fn [f val] (f val))] (apply (fn [x] (* x 2)) 21))");
     const env = try machine.createGlobalEnv(alloc);
-    try env.put("*", Value{ .Primitive = primMul }); // Inject local primitive multiplier
     const result = try machine.runLW(alloc, parsed, 42, env);
 
     try std.testing.expectEqual(@as(f64, 42.0), result[0].Float);
@@ -472,7 +634,7 @@ test "Eval Sample Trace" {
 
     const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
     const env = try machine.createGlobalEnv(alloc);
-    const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, std.StringHashMap(Value).init(alloc));
+    const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, machine.AddrValueMap.init(alloc));
 
     try std.testing.expectEqual(@as(usize, 1), trace_res.X.count());
 }
@@ -485,7 +647,7 @@ test "Eval Observe Trace" {
 
     const parsed = try parser.parse(alloc, "(observe (normal 0.0 1.0) 5.0)");
     const env = try machine.createGlobalEnv(alloc);
-    const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, std.StringHashMap(Value).init(alloc));
+    const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, machine.AddrValueMap.init(alloc));
 
     try std.testing.expectEqual(@as(usize, 1), trace_res.O.count());
 }
@@ -530,11 +692,12 @@ test "Initial Trace Registers Samples" {
 
     const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
     const env = try machine.createGlobalEnv(alloc);
-    const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, std.StringHashMap(Value).init(alloc));
+    const trace_res = try machine.runTrace(alloc, parsed, 42, env, null, machine.AddrValueMap.init(alloc));
 
     try std.testing.expectEqual(@as(usize, 1), trace_res.X.count());
     try std.testing.expectEqual(@as(usize, 1), trace_res.S.count());
-    try std.testing.expect(trace_res.X.contains(""));
+    const empty_addr = try alloc.alloc(machine.AddrItem, 0);
+    try std.testing.expect(trace_res.X.contains(empty_addr));
 }
 
 test "Initial Trace Registers Observes" {
@@ -545,9 +708,8 @@ test "Initial Trace Registers Observes" {
 
     const parsed = try parser.parse(alloc, "(observe (normal 0.0 1.0) 5.0)");
     const env = try machine.createGlobalEnv(alloc);
-    const trace_res = try machine.runTrace(alloc, parsed, 0, env, null, std.StringHashMap(Value).init(alloc));
+    const trace_res = try machine.runTrace(alloc, parsed, 0, env, null, machine.AddrValueMap.init(alloc));
 
-    // Test matches: self assert: (result trace observeDensities includesKey: #(#main))
     try std.testing.expectEqual(@as(usize, 1), trace_res.O.count());
 }
 
@@ -560,15 +722,16 @@ test "Cache Reuse At Non-Redraw Address" {
     const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
     const env = try machine.createGlobalEnv(alloc);
 
-    // We prepopulate the cache with our sample address mapping to 42
-    var cache = std.StringHashMap(Value).init(alloc);
-    try cache.put("", Value{ .Int = 42 });
+    var cache = machine.AddrValueMap.init(alloc);
+    const empty_addr = try alloc.alloc(machine.AddrItem, 0);
+    try cache.put(empty_addr, Value{ .Int = 42 });
 
-    // We set a non-matching redrawAddress ("another/")
-    const trace_res = try machine.runTrace(alloc, parsed, 12, env, "another/", cache);
+    var another_addr = try alloc.alloc(machine.AddrItem, 1);
+    another_addr[0] = .{ .then = {} };
+    const trace_res = try machine.runTrace(alloc, parsed, 12, env, another_addr, cache);
 
     try std.testing.expectEqual(@as(i64, 42), trace_res.value.Int);
-    try std.testing.expectEqual(@as(i64, 42), trace_res.X.get("").?.Int);
+    try std.testing.expectEqual(@as(i64, 42), trace_res.X.get(empty_addr).?.Int);
 }
 
 test "Redraw Site Forces New Sample" {
@@ -580,12 +743,11 @@ test "Redraw Site Forces New Sample" {
     const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
     const env = try machine.createGlobalEnv(alloc);
 
-    // We prepopulate the cache with 42
-    var cache = std.StringHashMap(Value).init(alloc);
-    try cache.put("", Value{ .Int = 42 });
+    var cache = machine.AddrValueMap.init(alloc);
+    const empty_addr = try alloc.alloc(machine.AddrItem, 0);
+    try cache.put(empty_addr, Value{ .Int = 42 });
 
-    // We force a redraw at the active address ""
-    const trace_res = try machine.runTrace(alloc, parsed, 4542, env, "", cache);
+    const trace_res = try machine.runTrace(alloc, parsed, 4542, env, empty_addr, cache);
 
     try std.testing.expect(trace_res.value.Float != 42.0);
 }
@@ -599,13 +761,15 @@ test "Absent Address In Cache Forces New Sample" {
     const parsed = try parser.parse(alloc, "(sample (normal 0.0 1.0))");
     const env = try machine.createGlobalEnv(alloc);
 
-    // Empty cache
-    const cache = std.StringHashMap(Value).init(alloc);
+    const cache = machine.AddrValueMap.init(alloc);
 
-    const trace_res = try machine.runTrace(alloc, parsed, 142, env, "another/", cache);
+    var another_addr = try alloc.alloc(machine.AddrItem, 1);
+    another_addr[0] = .{ .then = {} };
+    const trace_res = try machine.runTrace(alloc, parsed, 142, env, another_addr, cache);
 
-    try std.testing.expect(trace_res.X.contains(""));
-    try std.testing.expect(trace_res.X.get("").?.Float != 42.0);
+    const empty_addr = try alloc.alloc(machine.AddrItem, 0);
+    try std.testing.expect(trace_res.X.contains(empty_addr));
+    try std.testing.expect(trace_res.X.get(empty_addr).?.Float != 42.0);
 }
 
 test "Deterministic Trace Handling" {
@@ -617,7 +781,6 @@ test "Deterministic Trace Handling" {
     const parsed = try parser.parse(alloc, "42");
     const env = try machine.createGlobalEnv(alloc);
 
-    //  the machine should continue and retain the deterministic state
     const chain = try machine.runMH(alloc, parsed, 3442, env, 5, 2);
     try std.testing.expectEqual(@as(usize, 5), chain.len);
     for (chain) |val| {

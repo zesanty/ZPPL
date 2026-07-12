@@ -1,0 +1,8 @@
+(defn geom []
+  (if (sample (bernoulli 0.3))
+    0
+    (+ 1 (geom))))
+
+(let [g (geom)]
+  (observe (normal 3.0 1.0) g)
+  g)

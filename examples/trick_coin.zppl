@@ -1,0 +1,7 @@
+; we have a bag with two coins: a fair coin (50% chance of heads) and a trick coin (90% chance of heads). We select a coin at random, flip it, and observe heads (true). What is the exact probability that we selected the trick coin?
+
+(let [is-trick (sample (bernoulli 0.5))
+      bias (if is-trick 0.9 0.5)]
+  (observe (bernoulli bias) true)
+  (observe (bernoulli bias) true)
+  (if is-trick 1 0))
