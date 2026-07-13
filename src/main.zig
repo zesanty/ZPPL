@@ -164,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
     try writer.print("  /smc         - Switch to Sequential Monte Carlo\n", .{});
     try writer.print("  /mh          - Switch to Metropolis-Hastings\n", .{});
     try writer.print("  /seed <num>  - Set or inspect random seed for REPL evaluations\n\n", .{});
-    try writer.print("  /quit         - To quit\n", .{});
+    try writer.print("  quit         - To quit\n", .{});
 
     var repl_mode: enum { lw, smc, mh } = .lw;
     var repl_seed: u64 = 0;
