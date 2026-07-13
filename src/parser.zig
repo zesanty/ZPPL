@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 // TODO: value is in this case something needed for the VM, it may be worth it to later move the value into either Main or the VM file
 // And implement a Decoupled Form S-expr abstraction kind of struct that hooks with a Value.
 // Also the parser in general is currently Eager but could be Lazy with a bit of work.
+const Closure = @import("machine.zig").Closure;
+const Distribution = @import("probability.zig").Distribution;
 
 pub const ValueTag = enum {
     Nil,
@@ -17,9 +19,6 @@ pub const ValueTag = enum {
     Distribution,
     Primitive,
 };
-
-const Closure = @import("machine.zig").Closure;
-const Distribution = @import("probability.zig").Distribution;
 
 pub const Value = union(ValueTag) {
     Nil: void,
